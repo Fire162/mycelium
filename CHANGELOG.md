@@ -27,6 +27,10 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Support durable composite parent control and step resume with Redis and
+  PostgreSQL ledger storage. Parent lease, fence, and child evidence updates
+  use the shared atomic state CAS contract across workers.
+
 - Add a package reproducibility check (`.github/scripts/check-reproducible-build.py`,
   CI job `reproducible-build`). It builds the wheel and sdist twice from the same
   commit in clean source exports and fresh virtual environments, using the

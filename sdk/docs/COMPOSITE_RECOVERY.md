@@ -64,11 +64,14 @@ record pins an invocation to its original manifest and definition. Changing
 order, adding/removing steps, changing bindings, arguments, or destinations
 blocks recovery rather than minting fresh child identities.
 
-SQLite, file, and in-process storage provide the composite-control capability
-in this initial implementation. Other backends fail explicitly when composite
-mode is requested. In-memory storage is useful for unit tests only. This API is
-Python-runtime-only: it is not exposed by the language-neutral sidecar, and the
-shared PostgreSQL sidecar profile does not provide composite orchestration.
+SQLite, file, Redis, PostgreSQL, and in-process storage provide the
+composite-control capability. Redis and PostgreSQL persist parent records in
+their respective atomic state stores with revision-checked updates. Workers
+must use the same Redis key prefix or PostgreSQL ledger table and database to
+share parent authority. In-memory storage is useful for unit tests only. This
+API is Python-runtime-only: it is not exposed by the language-neutral sidecar,
+and the shared PostgreSQL sidecar profile does not provide composite
+orchestration.
 
 ## Decision record
 

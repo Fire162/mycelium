@@ -666,6 +666,7 @@ class RedisLedgerStorage:
         retention_seconds: float | None = None,
     ) -> None:
         from mycelium.ledger_model import LedgerEntry
+        from mycelium.storage.atomic_state import RedisAtomicStateBackend
 
         self._inner = RedisEntryStorage(
             url,
@@ -675,6 +676,9 @@ class RedisLedgerStorage:
             retention_seconds=retention_seconds,
         )
         self.retention_seconds = retention_seconds
+        self._composite_atomic_backend = RedisAtomicStateBackend(
+            url, prefix=f"{prefix.rstrip(':')}-composite:"
+        )
 
     def get(self, request_id: str) -> Any:
         return self._inner.get(request_id)

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from mycelium.ledger_model import LedgerError
+from mycelium.storage.atomic_state import NamespacedAtomicStorage
 from mycelium.transition import (
     SideEffectClass,
     ToolTransitionBinding,
@@ -344,14 +345,25 @@ def _build_manifest(func: Callable[..., Any], definition: str | None) -> Composi
 
 
 class _ControlStore:
-    """Small CAS store for parent records, supported by durable local stores."""
+    """Atomic parent records, shared by local and distributed ledger stores."""
 
     def __init__(self, storage: Any) -> None:
         self.storage = storage
+        backend = getattr(storage, "_composite_atomic_backend", None)
+        self._atomic = (
+            NamespacedAtomicStorage(
+                backend,
+                "composite-control-v1",
+                from_dict=dict,
+                to_dict=dict,
+            )
+            if backend is not None else None
+        )
         self._memory = getattr(storage, "_composite_records", None)
         if self._memory is None and storage.__class__.__name__ == "InMemoryLedgerStorage":
             self._memory = {}
             storage._composite_records = self._memory
+            storage._composite_lock = threading.RLock()
         path: Path | None = None
         inner = getattr(storage, "_inner", None)
         if inner is not None:
@@ -360,19 +372,26 @@ class _ControlStore:
         if path is None:
             path = getattr(file, "_path", None)
         self._path = Path(path).with_suffix(Path(path).suffix + ".composites.json") if path else None
-        if self._memory is None and self._path is None:
+        if self._memory is None and self._path is None and self._atomic is None:
             raise CompositeUnsupportedError(
                 f"{type(storage).__name__} has no atomic composite-control capability; "
-                "use SQLite, FileLedgerStorage, or InMemoryLedgerStorage"
+                "use SQLite, FileLedgerStorage, Redis, PostgreSQL, or InMemoryLedgerStorage"
             )
         self._lock = None
         if self._path is not None:
             from mycelium.storage.json_file import LockedJsonDictFile
 
             self._lock = LockedJsonDictFile(self._path)
-        self._memory_lock = threading.RLock()
+        self._memory_lock = getattr(storage, "_composite_lock", threading.RLock())
 
-    def _mutate(self, fn: Callable[[dict[str, Any]], R]) -> R:
+    def _mutate(self, key: str, fn: Callable[[dict[str, Any]], R]) -> R:
+        if self._atomic is not None:
+            def mutate(current: dict[str, Any] | None) -> tuple[dict[str, Any], R]:
+                data = {} if current is None else {key: current}
+                result = fn(data)
+                return data[key], result
+
+            return self._atomic.update_optional(key, mutate)
         if self._memory is not None:
             with self._memory_lock:
                 return fn(self._memory)
@@ -405,7 +424,7 @@ class _ControlStore:
                 )
             return dict(current)
 
-        return self._mutate(mutate)
+        return self._mutate(key, mutate)
 
     def acquire(self, key: str, owner: str, lease_ttl: float) -> dict[str, Any]:
         now = time.time()
@@ -421,7 +440,7 @@ class _ControlStore:
             rec["status"] = "RUNNING"
             data[key] = rec
             return dict(rec)
-        return self._mutate(mutate)
+        return self._mutate(key, mutate)
 
     def renew(self, key: str, owner: str, fence: int, lease_ttl: float) -> None:
         def mutate(data: dict[str, Any]) -> None:
@@ -432,7 +451,7 @@ class _ControlStore:
             if rec.get("owner") != owner or int(rec.get("fence", -1)) != fence:
                 raise CompositeAuthorityError(f"lost parent authority for {key!r}")
             rec["lease_until"] = time.time() + lease_ttl if lease_ttl > 0 else None
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
     def admit(
         self,
@@ -468,7 +487,7 @@ class _ControlStore:
                 return
             rec["children"][step.step_id] = {**binding, "outcome": "ADMITTED"}
             rec["next_step"] = index + 1
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
     def resolve_child(self, key: str, owner: str, fence: int, step: CompositeStep) -> None:
         """Record child resolution separately from admission under the parent fence."""
@@ -482,7 +501,7 @@ class _ControlStore:
             if child.get("outcome") not in {"ADMITTED", "COMPLETED"}:
                 raise CompositeDefinitionDriftError(f"child {step.step_id!r} has invalid outcome evidence")
             child["outcome"] = "COMPLETED"
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
     def boundary(self, key: str, owner: str, fence: int, lease_ttl: float) -> None:
         def mutate(data: dict[str, Any]) -> None:
@@ -490,7 +509,7 @@ class _ControlStore:
             if rec.get("owner") != owner or int(rec.get("fence", -1)) != fence:
                 raise CompositeAuthorityError("parent authority was reclaimed before the external-effect boundary")
             rec["lease_until"] = time.time() + lease_ttl
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
     def finish(
         self,
@@ -525,7 +544,7 @@ class _ControlStore:
             rec["finished_at"] = time.time()
             rec["owner"] = None
             rec["lease_until"] = None
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
     def release(self, key: str, owner: str, fence: int) -> None:
         """Release a live owner after a body exception without declaring success."""
@@ -535,7 +554,7 @@ class _ControlStore:
                 raise CompositeAuthorityError("stale worker cannot release composite ownership")
             rec["owner"] = None
             rec["lease_until"] = None
-        self._mutate(mutate)
+        self._mutate(key, mutate)
 
 
 _active_composite: ContextVar[CompositeInvocation | None] = ContextVar("mycelium_active_composite", default=None)
