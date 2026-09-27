@@ -7,6 +7,10 @@ small PyPI versions. Pre-release checklist: [sdk/docs/RELEASE.md](sdk/docs/RELEA
 
 ### Added
 
+- Add opt-in two-person approval before destructive grant issuance. Approvals
+  bind the exact canonical grant fields, expire, are consumed atomically, and
+  record both operator IDs with the issued grant.
+
 - Add a CI smoke suite for the bundled SDK examples
   (`sdk/tests/test_examples_smoke.py`). It runs a curated, credential-free
   subset offline with non-loopback network access blocked, validates example

@@ -4,9 +4,9 @@ Tool permission is not object authorization. A configured destructive tool
 may claim, execute, or cross a side-effect boundary only when the host has
 minted an exact grant: this operation, this canonical object, this scope
 when bound, before expiry, for at most ``max_uses``. The model cannot
-create, widen, renew, or approve a grant. Two-person approval before grant
-issuance remains host-owned; operator-release dual control is provided by
-``DualControlOperatorAuthorizer``.
+create, widen, renew, or approve a grant. Hosts can bind
+``DualControlDestructiveGrantAuthorizer`` to require two authenticated operators
+before any grant is stored.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import re
 import secrets
 import threading
@@ -25,6 +26,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ParamSpec, Protocol, TypeVar
 
+from mycelium.destructive_grant_approval import (
+    DestructiveGrantApprovalError,
+    DestructiveGrantApprovalRequest,
+    DualControlDestructiveGrantAuthorizer,
+)
 from mycelium.entity_guard import PAYLOAD_OMITTED
 from mycelium.storage.json_file import LockedJsonDictFile
 from mycelium.tool_boundary import ToolBoundaryError
@@ -119,6 +125,7 @@ _decision_var: ContextVar[DestructiveDecision | None] = ContextVar(
 )
 _canonicalizers: dict[str, Callable[[Any], str]] = {}
 _default_store: DestructiveGrantStore | None = None
+_grant_approval_authorizer: DualControlDestructiveGrantAuthorizer | None = None
 
 
 class DestructiveGrantError(ToolBoundaryError):
@@ -181,6 +188,7 @@ class DestructiveGrant:
     policy_version: str = "unspecified"
     policy_hash: str = ""
     provenance: str = PROVENANCE_HOST
+    approval_operator_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -199,6 +207,7 @@ class DestructiveGrant:
             "policy_version": self.policy_version,
             "policy_hash": self.policy_hash,
             "provenance": self.provenance,
+            "approval_operator_ids": list(self.approval_operator_ids),
         }
 
     @classmethod
@@ -233,6 +242,7 @@ class DestructiveGrant:
             policy_version=str(raw.get("policy_version") or "unspecified"),
             policy_hash=str(raw.get("policy_hash") or ""),
             provenance=str(raw.get("provenance") or PROVENANCE_HOST),
+            approval_operator_ids=tuple(raw.get("approval_operator_ids") or ()),
         )
 
 
@@ -381,6 +391,22 @@ def reset_destructive_grant_store(token: Token[DestructiveGrantStore | None]) ->
     _store_var.reset(token)
 
 
+def set_destructive_grant_approval_authorizer(
+    authorizer: DualControlDestructiveGrantAuthorizer | None,
+) -> DualControlDestructiveGrantAuthorizer | None:
+    """Bind a process-wide gate for every destructive grant issuance path."""
+    global _grant_approval_authorizer
+    previous = _grant_approval_authorizer
+    _grant_approval_authorizer = authorizer
+    return previous
+
+
+def reset_destructive_grant_approval_authorizer(
+    previous: DualControlDestructiveGrantAuthorizer | None,
+) -> None:
+    set_destructive_grant_approval_authorizer(previous)
+
+
 def get_active_destructive_policy() -> DestructiveConfirmPolicy | None:
     return _policy_var.get()
 
@@ -401,7 +427,7 @@ def get_active_destructive_decision() -> DestructiveDecision | None:
 
 def reset_destructive_confirm_state() -> None:
     """Clear process-local grant, policy, decision, clock, and canonicalizers."""
-    global _default_store
+    global _default_store, _grant_approval_authorizer
     from mycelium.authority_window import reset_authority_window_state
 
     _store_var.set(None)
@@ -409,6 +435,7 @@ def reset_destructive_confirm_state() -> None:
     _decision_var.set(None)
     _clock_var.set(None)
     _default_store = None
+    _grant_approval_authorizer = None
     _canonicalizers.clear()
     reset_authority_window_state()
 
@@ -828,6 +855,64 @@ class PostgresDestructiveGrantStore:
                     return result
 
 
+def prepare_destructive_grant_approval_request(
+    *,
+    operation: str,
+    object_type: str,
+    object_id: str,
+    request_id: str | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    tenant: str | None = None,
+    account: str | None = None,
+    expires_in: float = 300.0,
+    max_uses: int = 1,
+    policy_version: str = "unspecified",
+    case_sensitive: bool = True,
+    bind_request_id: bool = False,
+    bind_run_id: bool = False,
+    bind_thread_id: bool = False,
+) -> DestructiveGrantApprovalRequest:
+    """Canonicalize the exact fields operators must approve before issuance."""
+    if (
+        not isinstance(expires_in, (int, float))
+        or isinstance(expires_in, bool)
+        or not math.isfinite(expires_in)
+        or expires_in <= 0
+    ):
+        raise ValueError("expires_in must be a finite positive number of seconds")
+    if not isinstance(max_uses, int) or isinstance(max_uses, bool) or max_uses < 1:
+        raise ValueError("max_uses must be an integer >= 1")
+    op = canonicalize_operation(operation)
+    otype = canonicalize_object_type(object_type)
+    oid = canonicalize_object_id(object_id, object_type=otype, case_sensitive=case_sensitive)
+    tenant_id = canonicalize_scope_id(tenant, field="tenant") if tenant is not None else None
+    account_id = canonicalize_scope_id(account, field="account") if account is not None else None
+    req = canonicalize_scope_id(request_id, field="request_id") if request_id is not None else None
+    run = canonicalize_scope_id(run_id, field="run_id") if run_id is not None else None
+    thread = (
+        canonicalize_scope_id(thread_id, field="thread_id") if thread_id is not None else None
+    )
+    version = str(policy_version).strip() or "unspecified"
+    return DestructiveGrantApprovalRequest(
+        operation=op,
+        object_type=otype,
+        object_id=oid,
+        request_id=req,
+        run_id=run,
+        thread_id=thread,
+        tenant=tenant_id,
+        account=account_id,
+        expires_in=float(expires_in),
+        max_uses=max_uses,
+        policy_version=version,
+        case_sensitive=case_sensitive,
+        bind_request_id=bind_request_id,
+        bind_run_id=bind_run_id,
+        bind_thread_id=bind_thread_id,
+    )
+
+
 def issue_destructive_grant(
     *,
     operation: str,
@@ -846,51 +931,26 @@ def issue_destructive_grant(
     bind_request_id: bool = False,
     bind_run_id: bool = False,
     bind_thread_id: bool = False,
+    approval_operator_id: str | None = None,
+    approval_credential: str | None = None,
 ) -> DestructiveGrant:
-    """Mint a host-controlled grant. Never call this from model-controlled code."""
-    if not isinstance(expires_in, (int, float)) or expires_in <= 0:
-        raise ValueError("expires_in must be a positive number of seconds")
-    if not isinstance(max_uses, int) or isinstance(max_uses, bool) or max_uses < 1:
-        raise ValueError("max_uses must be an integer >= 1")
-    op = canonicalize_operation(operation)
-    otype = canonicalize_object_type(object_type)
-    oid = canonicalize_object_id(object_id, object_type=otype, case_sensitive=case_sensitive)
-    tenant_id = canonicalize_scope_id(tenant, field="tenant") if tenant is not None else None
-    account_id = canonicalize_scope_id(account, field="account") if account is not None else None
-    req = canonicalize_scope_id(request_id, field="request_id") if request_id is not None else None
-    run = canonicalize_scope_id(run_id, field="run_id") if run_id is not None else None
-    thread = (
-        canonicalize_scope_id(thread_id, field="thread_id") if thread_id is not None else None
-    )
-    now = _now()
-    version = str(policy_version).strip() or "unspecified"
-    grant = DestructiveGrant(
-        grant_id=secrets.token_urlsafe(18),
-        operation=op,
-        object_type=otype,
-        object_id=oid,
-        issued_at=now,
-        expires_at=now + float(expires_in),
+    """Mint a host-controlled grant after bound approval, when configured."""
+    request = prepare_destructive_grant_approval_request(
+        operation=operation,
+        object_type=object_type,
+        object_id=object_id,
+        request_id=request_id,
+        run_id=run_id,
+        thread_id=thread_id,
+        tenant=tenant,
+        account=account,
+        expires_in=expires_in,
         max_uses=max_uses,
-        request_id=req,
-        run_id=run,
-        thread_id=thread,
-        tenant=tenant_id,
-        account=account_id,
-        policy_version=version,
-        policy_hash=policy_hash_for(
-            operation=op,
-            object_type=otype,
-            object_id=oid,
-            tenant=tenant_id,
-            account=account_id,
-            max_uses=max_uses,
-            bind_request_id=bind_request_id,
-            bind_run_id=bind_run_id,
-            bind_thread_id=bind_thread_id,
-            policy_version=version,
-        ),
-        provenance=PROVENANCE_HOST,
+        policy_version=policy_version,
+        case_sensitive=case_sensitive,
+        bind_request_id=bind_request_id,
+        bind_run_id=bind_run_id,
+        bind_thread_id=bind_thread_id,
     )
     target = store if store is not None else get_destructive_grant_store()
     if target is None:
@@ -899,6 +959,50 @@ def issue_destructive_grant(
             "set_destructive_grant_store(...) or destructive_grants.bind(config) "
             "before issue_destructive_grant()."
         )
+    authorizer = _grant_approval_authorizer
+    if authorizer is None:
+        if approval_operator_id is not None or approval_credential is not None:
+            raise DestructiveGrantApprovalError("no destructive grant approval authorizer is bound")
+        approval_operator_ids: tuple[str, ...] = ()
+    else:
+        first_operator = authorizer.authorize_issuance(
+            request,
+            operator_id=approval_operator_id,
+            credential=approval_credential,
+        )
+        if first_operator is None or approval_operator_id is None:
+            raise DestructiveGrantApprovalError("destructive grant issuance requires two approvals")
+        approval_operator_ids = (first_operator, approval_operator_id)
+    now = _now()
+    grant = DestructiveGrant(
+        grant_id=secrets.token_urlsafe(18),
+        operation=request.operation,
+        object_type=request.object_type,
+        object_id=request.object_id,
+        issued_at=now,
+        expires_at=now + request.expires_in,
+        max_uses=request.max_uses,
+        request_id=request.request_id,
+        run_id=request.run_id,
+        thread_id=request.thread_id,
+        tenant=request.tenant,
+        account=request.account,
+        policy_version=request.policy_version,
+        policy_hash=policy_hash_for(
+            operation=request.operation,
+            object_type=request.object_type,
+            object_id=request.object_id,
+            tenant=request.tenant,
+            account=request.account,
+            max_uses=request.max_uses,
+            bind_request_id=request.bind_request_id,
+            bind_run_id=request.bind_run_id,
+            bind_thread_id=request.bind_thread_id,
+            policy_version=request.policy_version,
+        ),
+        provenance=PROVENANCE_HOST,
+        approval_operator_ids=approval_operator_ids,
+    )
     target.put(grant)
     return grant
 
@@ -1725,6 +1829,8 @@ __all__ = [
     "DestructiveConfirmPolicy",
     "DestructiveDecision",
     "DestructiveGrant",
+    "DestructiveGrantApprovalError",
+    "DestructiveGrantApprovalRequest",
     "DestructiveGrantError",
     "DestructiveGrantSpec",
     "DestructiveObjectSpec",
@@ -1746,10 +1852,13 @@ __all__ = [
     "get_active_destructive_policy",
     "get_destructive_grant_store",
     "issue_destructive_grant",
+    "prepare_destructive_grant_approval_request",
     "register_destructive_object_canonicalizer",
     "registered_destructive_canonicalizers",
     "reset_destructive_confirm_state",
+    "reset_destructive_grant_approval_authorizer",
     "sanitize_destructive_evidence",
     "set_destructive_clock",
+    "set_destructive_grant_approval_authorizer",
     "set_destructive_grant_store",
 ]

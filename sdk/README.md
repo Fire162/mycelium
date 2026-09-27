@@ -1895,7 +1895,9 @@ exact operation** on **this exact canonical object**, in this scope/run
 when bound, before expiry, for at most `max_uses`. The model cannot
 create, widen, renew, or approve a grant. Use
 `DualControlOperatorAuthorizer` when the host requires two distinct
-authenticated operators before releasing a blocked destructive action.
+authenticated operators before releasing a blocked destructive action. To
+require two people **before issuing a grant**, bind
+`DualControlDestructiveGrantAuthorizer` in the trusted host.
 
 ```yaml
 destructive_confirm:
@@ -1958,6 +1960,43 @@ with execution_scope(
 ):
     agent.run(...)
 ```
+
+For two-person issuance, prepare the same exact fields the host will issue.
+The first operator approves; a distinct second operator supplies credentials
+at issuance. Once bound, both `issue_destructive_grant` and
+`destructive_grants.issue` refuse unapproved grants.
+
+```python
+from mycelium import (
+    DualControlDestructiveGrantAuthorizer,
+    issue_destructive_grant,
+    prepare_destructive_grant_approval_request,
+    set_destructive_grant_approval_authorizer,
+)
+
+authorizer = DualControlDestructiveGrantAuthorizer(
+    authenticate_operator,  # host-owned (operator_id, credential) -> bool
+    approval_backend=shared_atomic_state,
+)
+set_destructive_grant_approval_authorizer(authorizer)
+fields = dict(
+    operation="refund", object_type="payment", object_id="pay_123",
+    request_id="refund-123", tenant="acme", max_uses=1,
+    policy_version="2026.09",
+)
+request = prepare_destructive_grant_approval_request(**fields)
+authorizer.approve(request, operator_id="alice", credential=alice_credential)
+grant = issue_destructive_grant(
+    **fields, store=grant_store,
+    approval_operator_id="bob", approval_credential=bob_credential,
+)
+```
+
+Use a shared atomic state backend for approvals across workers. Approval is
+single-use and records both operator IDs in the grant. A failed grant-store
+write consumes the approval; the host must obtain a fresh approval before
+retrying. Issuance approval is opt-in so existing host workflows keep their
+current behavior until the host binds an authorizer.
 
 Do not infer destructiveness from tool names. Production protection
 depends on this explicit configuration or a trusted

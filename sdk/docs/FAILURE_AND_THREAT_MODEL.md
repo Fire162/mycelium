@@ -264,8 +264,9 @@ section; the tests are concrete `file::test_name` entries.
     destructive tool may execute only with a host-issued grant for this
     exact operation and canonical object, before expiry, for at most
     `max_uses`. Tool permission is not object authorization. The model
-    cannot mint or widen grants. `DualControlOperatorAuthorizer` can require
-    two distinct authenticated operators before release.
+    cannot mint or widen grants. `DualControlDestructiveGrantAuthorizer` can
+    require two distinct authenticated operators before grant issuance, while
+    `DualControlOperatorAuthorizer` provides the same control before release.
     Omitted `destructive_confirm:` keeps existing behavior.
     *Where:* [Destructive confirm (AF-011)](../README.md#destructive-confirm-af-011).
 
