@@ -433,6 +433,7 @@ def test_renewal_failure_blocks_the_next_child(tmp_path, monkeypatch) -> None:
 def test_stale_worker_cannot_admit_after_parent_reclaim(tmp_path, monkeypatch) -> None:
     storage = SqliteLedgerStorage(tmp_path / "ledger.sqlite")
     started = threading.Event()
+    release_stale = threading.Event()
     calls: list[str] = []
 
     @ledger_sync(storage=storage, transition_binding=_binding())
@@ -442,12 +443,18 @@ def test_stale_worker_cannot_admit_after_parent_reclaim(tmp_path, monkeypatch) -
         return "ok"
 
     def pause_for_reclaim() -> None:
-        started.set()
-        time.sleep(0.3)
+        if threading.current_thread().name == "stale-worker":
+            started.set()
+            release_stale.wait(timeout=2)
 
     register_composite_helper(pause_for_reclaim)
     original_start_renewal = CompositeInvocation._start_renewal
-    monkeypatch.setattr(CompositeInvocation, "_start_renewal", lambda _self: None)
+
+    def start_renewal_except_stale(invocation: CompositeInvocation) -> None:
+        if threading.current_thread().name != "stale-worker":
+            original_start_renewal(invocation)
+
+    monkeypatch.setattr(CompositeInvocation, "_start_renewal", start_renewal_except_stale)
 
     @composite(storage, lease_ttl=0.05)
     def publish(operation_id: str) -> str:
@@ -462,13 +469,17 @@ def test_stale_worker_cannot_admit_after_parent_reclaim(tmp_path, monkeypatch) -
         except BaseException as exc:
             errors.append(exc)
 
-    worker = threading.Thread(target=stale_worker)
+    worker = threading.Thread(target=stale_worker, name="stale-worker")
     worker.start()
-    assert started.wait(timeout=2)
-    monkeypatch.setattr(CompositeInvocation, "_start_renewal", original_start_renewal)
-    time.sleep(0.15)
-    assert publish(operation_id="reclaim") == "ok"
-    worker.join(timeout=2)
+    try:
+        assert started.wait(timeout=2)
+        controls = json.loads((tmp_path / "ledger.sqlite.composites.json").read_text())
+        lease_until = controls["mycelium:reclaim"]["lease_until"]
+        time.sleep(max(0, lease_until - time.time()) + 0.02)
+        assert publish(operation_id="reclaim") == "ok"
+    finally:
+        release_stale.set()
+        worker.join(timeout=2)
     assert not worker.is_alive()
     assert any(isinstance(error, CompositeAuthorityError) for error in errors)
     assert calls == ["effect"]
